@@ -12,6 +12,11 @@
 | **数据库** | PostgreSQL 16 + Redis |
 | **包管理** | 后端: go modules, 前端: **pnpm**（不是 npm） |
 
+## 相关开发文档
+
+- [多平台与新平台接入开发指南](docs/MULTI_PLATFORM_DEVELOPMENT_CN.md)
+- [新平台接入：人类最少工作指南与 AI 提示词](docs/PLATFORM_ONBOARDING_MINIMAL_HUMAN_GUIDE_CN.md)
+
 ## 二、本地环境配置
 
 ### PostgreSQL 16 (Windows 服务)
