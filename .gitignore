@@ -127,6 +127,8 @@ deploy/docker-compose.override.yml
 .gocache/
 vite.config.js
 docs/*
+!docs/MULTI_PLATFORM_DEVELOPMENT_CN.md
+!docs/PLATFORM_ONBOARDING_MINIMAL_HUMAN_GUIDE_CN.md
 !docs/PAYMENT.md
 !docs/PAYMENT_CN.md
 .serena/
