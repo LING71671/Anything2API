@@ -88,6 +88,9 @@ func RegisterAdminRoutes(
 
 		// 渠道管理
 		registerChannelRoutes(admin, h)
+
+		// 平台与动态 Web 来源
+		registerPlatformRoutes(admin, h)
 	}
 }
 
@@ -561,5 +564,25 @@ func registerChannelRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		channels.POST("", h.Admin.Channel.Create)
 		channels.PUT("/:id", h.Admin.Channel.Update)
 		channels.DELETE("/:id", h.Admin.Channel.Delete)
+	}
+}
+
+func registerPlatformRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	platforms := admin.Group("/platforms")
+	{
+		platforms.GET("", h.Admin.Platform.ListPlatforms)
+		platforms.GET("/:platform", h.Admin.Platform.GetPlatform)
+		platforms.POST("/:platform/oauth/auth-url", h.Admin.Platform.GenerateWebSourceAuthURL)
+		platforms.POST("/:platform/oauth/exchange-code", h.Admin.Platform.ExchangeWebSourceCode)
+		platforms.POST("/:platform/accounts/:id/refresh", h.Admin.Platform.RefreshWebSourceAccount)
+	}
+
+	webSources := admin.Group("/web-source-platforms")
+	{
+		webSources.GET("", h.Admin.Platform.ListWebSourcePlatforms)
+		webSources.POST("", h.Admin.Platform.CreateWebSourcePlatform)
+		webSources.PUT("/:platform", h.Admin.Platform.UpdateWebSourcePlatform)
+		webSources.POST("/:platform/disable", h.Admin.Platform.DisableWebSourcePlatform)
+		webSources.DELETE("/:platform", h.Admin.Platform.DeleteWebSourcePlatform)
 	}
 }

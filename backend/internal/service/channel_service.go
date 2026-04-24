@@ -142,16 +142,22 @@ const (
 type ChannelService struct {
 	repo                 ChannelRepository
 	authCacheInvalidator APIKeyAuthCacheInvalidator
+	platformService      *PlatformService
 
 	cache   atomic.Value // *channelCache
 	cacheSF singleflight.Group
 }
 
 // NewChannelService 创建渠道服务实例
-func NewChannelService(repo ChannelRepository, authCacheInvalidator APIKeyAuthCacheInvalidator) *ChannelService {
+func NewChannelService(repo ChannelRepository, authCacheInvalidator APIKeyAuthCacheInvalidator, platformServices ...*PlatformService) *ChannelService {
+	var platformService *PlatformService
+	if len(platformServices) > 0 {
+		platformService = platformServices[0]
+	}
 	s := &ChannelService{
 		repo:                 repo,
 		authCacheInvalidator: authCacheInvalidator,
+		platformService:      platformService,
 	}
 	return s
 }
@@ -691,6 +697,9 @@ func (s *ChannelService) Create(ctx context.Context, input *CreateChannelInput) 
 	if err := validateChannelConfig(channel.ModelPricing, channel.ModelMapping); err != nil {
 		return nil, err
 	}
+	if err := s.validateChannelPlatforms(ctx, channel); err != nil {
+		return nil, err
+	}
 	for i, rule := range channel.AccountStatsPricingRules {
 		if err := validatePricingEntries(rule.Pricing); err != nil {
 			return nil, fmt.Errorf("account stats pricing rule #%d: %w", i+1, err)
@@ -722,6 +731,9 @@ func (s *ChannelService) Update(ctx context.Context, id int64, input *UpdateChan
 	}
 
 	if err := validateChannelConfig(channel.ModelPricing, channel.ModelMapping); err != nil {
+		return nil, err
+	}
+	if err := s.validateChannelPlatforms(ctx, channel); err != nil {
 		return nil, err
 	}
 	for i, rule := range channel.AccountStatsPricingRules {
@@ -789,6 +801,39 @@ func (s *ChannelService) applyUpdateInput(ctx context.Context, channel *Channel,
 	}
 	if input.AccountStatsPricingRules != nil {
 		channel.AccountStatsPricingRules = *input.AccountStatsPricingRules
+	}
+	return nil
+}
+
+func (s *ChannelService) validateChannelPlatforms(ctx context.Context, channel *Channel) error {
+	if s.platformService == nil || channel == nil {
+		return nil
+	}
+	for _, pricing := range channel.ModelPricing {
+		if strings.TrimSpace(pricing.Platform) == "" {
+			continue
+		}
+		if !s.platformService.IsKnownPlatform(ctx, pricing.Platform) {
+			return fmt.Errorf("unsupported pricing platform: %s", pricing.Platform)
+		}
+	}
+	for platform := range channel.ModelMapping {
+		if strings.TrimSpace(platform) == "" {
+			continue
+		}
+		if !s.platformService.IsKnownPlatform(ctx, platform) {
+			return fmt.Errorf("unsupported model mapping platform: %s", platform)
+		}
+	}
+	for i, rule := range channel.AccountStatsPricingRules {
+		for _, pricing := range rule.Pricing {
+			if strings.TrimSpace(pricing.Platform) == "" {
+				continue
+			}
+			if !s.platformService.IsKnownPlatform(ctx, pricing.Platform) {
+				return fmt.Errorf("account stats pricing rule #%d unsupported platform: %s", i+1, pricing.Platform)
+			}
+		}
 	}
 	return nil
 }

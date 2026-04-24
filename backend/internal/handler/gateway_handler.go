@@ -33,11 +33,13 @@ import (
 const gatewayCompatibilityMetricsLogInterval = 1024
 
 var gatewayCompatibilityMetricsLogCounter atomic.Uint64
+var gatewayOnyxSessionMetricsLogCounter atomic.Uint64
 
 // GatewayHandler handles API gateway requests
 type GatewayHandler struct {
 	gatewayService            *service.GatewayService
 	geminiCompatService       *service.GeminiMessagesCompatService
+	webGatewayService         *service.WebGatewayService
 	antigravityGatewayService *service.AntigravityGatewayService
 	userService               *service.UserService
 	billingCacheService       *service.BillingCacheService
@@ -57,6 +59,7 @@ type GatewayHandler struct {
 func NewGatewayHandler(
 	gatewayService *service.GatewayService,
 	geminiCompatService *service.GeminiMessagesCompatService,
+	webGatewayService *service.WebGatewayService,
 	antigravityGatewayService *service.AntigravityGatewayService,
 	userService *service.UserService,
 	concurrencyService *service.ConcurrencyService,
@@ -91,6 +94,7 @@ func NewGatewayHandler(
 	return &GatewayHandler{
 		gatewayService:            gatewayService,
 		geminiCompatService:       geminiCompatService,
+		webGatewayService:         webGatewayService,
 		antigravityGatewayService: antigravityGatewayService,
 		userService:               userService,
 		billingCacheService:       billingCacheService,
@@ -130,6 +134,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		zap.Any("group_id", apiKey.GroupID),
 	)
 	defer h.maybeLogCompatibilityFallbackMetrics(reqLog)
+	defer h.maybeLogOnyxSessionMetrics(reqLog)
 
 	// 读取请求体
 	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
@@ -258,6 +263,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		APIKeyID:  apiKey.ID,
 	}
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
+	parsedReq.SessionHash = sessionHash
 
 	// 获取平台：优先使用强制平台（/antigravity 路由，中间件已设置 request.Context），否则使用分组平台
 	platform := ""
@@ -686,6 +692,8 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			writerSizeBeforeForward := c.Writer.Size()
 			if account.Platform == service.PlatformAntigravity && account.Type != service.AccountTypeAPIKey {
 				result, err = h.antigravityGatewayService.Forward(requestCtx, c, account, body, hasBoundSession)
+			} else if service.IsWebPlatformKey(account.Platform) {
+				result, err = h.webGatewayService.Forward(requestCtx, c, account, parsedReq)
 			} else {
 				result, err = h.gatewayService.Forward(requestCtx, c, account, parsedReq)
 			}
@@ -1396,6 +1404,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 		zap.Any("group_id", apiKey.GroupID),
 	)
 	defer h.maybeLogCompatibilityFallbackMetrics(reqLog)
+	defer h.maybeLogOnyxSessionMetrics(reqLog)
 
 	// 读取请求体
 	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
@@ -1453,6 +1462,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 		APIKeyID:  apiKey.ID,
 	}
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
+	parsedReq.SessionHash = sessionHash
 
 	// 选择支持该模型的账号
 	account, err := h.gatewayService.SelectAccountForModel(c.Request.Context(), apiKey.GroupID, sessionHash, parsedReq.Model)
@@ -1736,6 +1746,36 @@ func (h *GatewayHandler) maybeLogCompatibilityFallbackMetrics(reqLog *zap.Logger
 		zap.Int64("session_hash_legacy_dual_write_total", metrics.SessionHashLegacyDualWriteTotal),
 		zap.Float64("session_hash_legacy_read_hit_rate", metrics.SessionHashLegacyReadHitRate),
 		zap.Int64("metadata_legacy_fallback_total", metrics.MetadataLegacyFallbackTotal),
+	)
+}
+
+func (h *GatewayHandler) maybeLogOnyxSessionMetrics(reqLog *zap.Logger) {
+	if reqLog == nil {
+		return
+	}
+	if gatewayOnyxSessionMetricsLogCounter.Add(1)%gatewayCompatibilityMetricsLogInterval != 0 {
+		return
+	}
+	metrics := service.SnapshotOnyxSessionMetrics()
+	reqLog.Info("gateway.onyx_session_metrics",
+		zap.Int64("local_hot_hit_total", metrics.LocalHotHitTotal),
+		zap.Int64("shared_store_hit_total", metrics.SharedStoreHitTotal),
+		zap.Int64("shared_store_miss_total", metrics.SharedStoreMissTotal),
+		zap.Int64("stateless_bypass_total", metrics.StatelessBypassTotal),
+		zap.Int64("shared_store_get_error_total", metrics.SharedStoreGetErrorTotal),
+		zap.Int64("shared_store_set_error_total", metrics.SharedStoreSetErrorTotal),
+		zap.Int64("shared_store_delete_error_total", metrics.SharedStoreDeleteErrorTotal),
+		zap.Int64("create_chat_session_total", metrics.CreateChatSessionTotal),
+		zap.Int64("create_chat_session_success_total", metrics.CreateChatSessionSuccessTotal),
+		zap.Int64("streaming_parent_advance_total", metrics.StreamingParentAdvanceTotal),
+		zap.Int64("nonstream_parent_refresh_total", metrics.NonstreamParentRefreshTotal),
+		zap.Int64("nonstream_parent_refresh_success_total", metrics.NonstreamParentRefreshSuccessTotal),
+		zap.Int64("invalid_session_retry_total", metrics.InvalidSessionRetryTotal),
+		zap.Int64("invalid_session_retry_success_total", metrics.InvalidSessionRetrySuccessTotal),
+		zap.Int64("shared_store_degraded_read_total", metrics.SharedStoreDegradedReadTotal),
+		zap.Int64("shared_store_degraded_write_total", metrics.SharedStoreDegradedWriteTotal),
+		zap.Float64("shared_store_hit_rate", metrics.SharedStoreHitRate),
+		zap.Float64("invalid_session_retry_success_rate", metrics.InvalidSessionRetrySuccessRate),
 	)
 }
 

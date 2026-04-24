@@ -195,9 +195,11 @@ func ProvideSchedulerSnapshotService(
 	outboxRepo SchedulerOutboxRepository,
 	accountRepo AccountRepository,
 	groupRepo GroupRepository,
+	platforms *PlatformService,
 	cfg *config.Config,
 ) *SchedulerSnapshotService {
 	svc := NewSchedulerSnapshotService(cache, outboxRepo, accountRepo, groupRepo, cfg)
+	svc.SetPlatformService(platforms)
 	svc.Start()
 	return svc
 }
@@ -400,6 +402,8 @@ var ProviderSet = wire.NewSet(
 	NewBillingCacheService,
 	NewAnnouncementService,
 	NewAdminService,
+	NewPlatformService,
+	NewWebSourceOAuthService,
 	NewGatewayService,
 	NewOpenAIGatewayService,
 	NewOAuthService,
@@ -412,6 +416,7 @@ var ProviderSet = wire.NewSet(
 	NewOAuthRefreshAPI,
 	ProvideGeminiTokenProvider,
 	NewGeminiMessagesCompatService,
+	NewWebGatewayService,
 	ProvideAntigravityTokenProvider,
 	ProvideOpenAITokenProvider,
 	ProvideClaudeTokenProvider,

@@ -439,6 +439,7 @@ type adminServiceImpl struct {
 	defaultSubAssigner   DefaultSubscriptionAssigner
 	userSubRepo          UserSubscriptionRepository
 	privacyClientFactory PrivacyClientFactory
+	platformService      *PlatformService
 }
 
 type userGroupRateBatchReader interface {
@@ -463,7 +464,12 @@ func NewAdminService(
 	defaultSubAssigner DefaultSubscriptionAssigner,
 	userSubRepo UserSubscriptionRepository,
 	privacyClientFactory PrivacyClientFactory,
+	platformServices ...*PlatformService,
 ) AdminService {
+	var platformService *PlatformService
+	if len(platformServices) > 0 {
+		platformService = platformServices[0]
+	}
 	return &adminServiceImpl{
 		userRepo:             userRepo,
 		groupRepo:            groupRepo,
@@ -481,7 +487,35 @@ func NewAdminService(
 		defaultSubAssigner:   defaultSubAssigner,
 		userSubRepo:          userSubRepo,
 		privacyClientFactory: privacyClientFactory,
+		platformService:      platformService,
 	}
+}
+
+func (s *adminServiceImpl) validatePlatform(ctx context.Context, platform string) error {
+	platform = strings.TrimSpace(platform)
+	if platform == "" {
+		return errors.New("platform is required")
+	}
+	if s.platformService == nil {
+		if isBuiltinPlatformKey(platform) || platform == PlatformWeb {
+			return nil
+		}
+		return fmt.Errorf("unsupported platform: %s", platform)
+	}
+	if !s.platformService.IsKnownPlatform(ctx, platform) {
+		return fmt.Errorf("unsupported platform: %s", platform)
+	}
+	return nil
+}
+
+func (s *adminServiceImpl) isWebSourcePlatform(ctx context.Context, platform string) bool {
+	if platform == PlatformWeb {
+		return true
+	}
+	if s.platformService != nil {
+		return s.platformService.IsWebSourcePlatform(ctx, platform)
+	}
+	return IsWebPlatformKey(platform)
 }
 
 // User management implementations
@@ -828,6 +862,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	if platform == "" {
 		platform = PlatformAnthropic
 	}
+	if err := s.validatePlatform(ctx, platform); err != nil {
+		return nil, err
+	}
 
 	subscriptionType := input.SubscriptionType
 	if subscriptionType == "" {
@@ -1060,6 +1097,9 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		group.Description = input.Description
 	}
 	if input.Platform != "" {
+		if err := s.validatePlatform(ctx, input.Platform); err != nil {
+			return nil, err
+		}
 		group.Platform = input.Platform
 	}
 	if input.RateMultiplier != nil {
@@ -1512,6 +1552,22 @@ func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([
 }
 
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	if err := s.validatePlatform(ctx, input.Platform); err != nil {
+		return nil, err
+	}
+	if input.Platform == PlatformWeb {
+		if input.Type != AccountTypeUpstream {
+			return nil, errors.New("web platform accounts must use upstream account type")
+		}
+		if _, err := parseWebCredentials(&Account{Platform: input.Platform, Type: input.Type, Credentials: input.Credentials}); err != nil {
+			return nil, err
+		}
+	} else if s.isWebSourcePlatform(ctx, input.Platform) {
+		if input.Type != AccountTypeOAuth && input.Type != AccountTypeUpstream {
+			return nil, errors.New("dynamic web platform accounts must use oauth or upstream account type")
+		}
+	}
+
 	// 绑定分组
 	groupIDs := input.GroupIDs
 	// 如果没有指定分组,自动绑定对应平台的默认分组
@@ -1626,12 +1682,23 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		account.Name = input.Name
 	}
 	if input.Type != "" {
+		if account.Platform == PlatformWeb && input.Type != AccountTypeUpstream {
+			return nil, errors.New("web platform accounts must use upstream account type")
+		}
+		if account.Platform != PlatformWeb && s.isWebSourcePlatform(ctx, account.Platform) && input.Type != AccountTypeOAuth && input.Type != AccountTypeUpstream {
+			return nil, errors.New("dynamic web platform accounts must use oauth or upstream account type")
+		}
 		account.Type = input.Type
 	}
 	if input.Notes != nil {
 		account.Notes = normalizeAccountNotes(input.Notes)
 	}
 	if len(input.Credentials) > 0 {
+		if account.Platform == PlatformWeb {
+			if _, err := parseWebCredentials(&Account{Platform: account.Platform, Type: account.Type, Credentials: input.Credentials}); err != nil {
+				return nil, err
+			}
+		}
 		account.Credentials = input.Credentials
 	}
 	// Extra 使用 map：需要区分“未提供(nil)”与“显式清空({})”。

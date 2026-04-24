@@ -24,6 +24,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
 )
 
 // sseDataPrefix matches SSE data lines with optional whitespace after colon.
@@ -62,6 +63,8 @@ type AccountTestService struct {
 	httpUpstream              HTTPUpstream
 	cfg                       *config.Config
 	tlsFPProfileService       *TLSFingerprintProfileService
+	platformService           *PlatformService
+	onyxSessionStore          OnyxSessionStore
 }
 
 // NewAccountTestService creates a new AccountTestService
@@ -72,6 +75,8 @@ func NewAccountTestService(
 	httpUpstream HTTPUpstream,
 	cfg *config.Config,
 	tlsFPProfileService *TLSFingerprintProfileService,
+	platformService *PlatformService,
+	onyxSessionStore OnyxSessionStore,
 ) *AccountTestService {
 	return &AccountTestService{
 		accountRepo:               accountRepo,
@@ -80,6 +85,8 @@ func NewAccountTestService(
 		httpUpstream:              httpUpstream,
 		cfg:                       cfg,
 		tlsFPProfileService:       tlsFPProfileService,
+		platformService:           platformService,
+		onyxSessionStore:          onyxSessionStore,
 	}
 }
 
@@ -181,7 +188,195 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.routeAntigravityTest(c, account, modelID, prompt)
 	}
 
+	if IsWebPlatformKey(account.Platform) {
+		return s.testWebAccountConnection(c, account, modelID, prompt)
+	}
+
 	return s.testClaudeAccountConnection(c, account, modelID)
+}
+
+func (s *AccountTestService) testWebAccountConnection(c *gin.Context, account *Account, modelID string, prompt string) error {
+	testModelID := strings.TrimSpace(modelID)
+	if testModelID == "" {
+		testModelID = "web-default"
+	}
+	if strings.TrimSpace(prompt) == "" {
+		prompt = "Hello, please reply with a short test message."
+	}
+	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
+
+	webSvc := NewWebGatewayService(s.httpUpstream, s.cfg, nil, s.platformService, s.onyxSessionStore)
+	if creds, err := webSvc.resolveWebCredentials(c.Request.Context(), account); err == nil && creds.SupportsStream {
+		return s.testWebAccountStreamingConnection(c, webSvc, account, testModelID, prompt, creds)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"model":  testModelID,
+		"stream": false,
+		"messages": []map[string]any{
+			{"role": "user", "content": prompt},
+		},
+	})
+	parsed, err := ParseGatewayRequest(body, PlatformAnthropic)
+	if err != nil {
+		return s.sendErrorAndEnd(c, "Failed to build web test request")
+	}
+
+	rec := httptest.NewRecorder()
+	fakeCtx, _ := gin.CreateTestContext(rec)
+	fakeReq, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	fakeReq.Header = c.Request.Header.Clone()
+	fakeCtx.Request = fakeReq
+
+	result, err := webSvc.Forward(c.Request.Context(), fakeCtx, account, parsed)
+	if err != nil {
+		return s.sendErrorAndEnd(c, err.Error())
+	}
+	text := gjson.Get(rec.Body.String(), "content.0.text").String()
+	if strings.TrimSpace(text) == "" {
+		return s.sendErrorAndEnd(c, "Web upstream returned an empty test response")
+	}
+	if result != nil && strings.TrimSpace(result.RequestID) != "" {
+		s.sendEvent(c, TestEvent{Type: "request_id", Text: result.RequestID})
+	}
+	if result != nil {
+		s.sendEvent(c, TestEvent{Type: "usage", Data: map[string]any{
+			"input_tokens":  result.Usage.InputTokens,
+			"output_tokens": result.Usage.OutputTokens,
+			"total_tokens":  result.Usage.InputTokens + result.Usage.OutputTokens + result.Usage.CacheCreationInputTokens + result.Usage.CacheReadInputTokens,
+			"source":        webUsageSource(result.UsageEstimated),
+		}})
+	}
+	s.sendEvent(c, TestEvent{Type: "content", Text: text})
+	s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
+	return nil
+}
+
+func webUsageSource(estimated bool) string {
+	if estimated {
+		return "estimated"
+	}
+	return "upstream"
+}
+
+func (s *AccountTestService) testWebAccountStreamingConnection(c *gin.Context, webSvc *WebGatewayService, account *Account, modelID, prompt string, creds webCredentials) error {
+	request := map[string]any{
+		"model":  modelID,
+		"stream": true,
+		"stream_options": map[string]any{
+			"include_usage": true,
+		},
+		"messages": []map[string]any{
+			{"role": "user", "content": prompt},
+		},
+	}
+	if webCredentialsLikelySupportTools(creds) {
+		request["tools"] = []map[string]any{{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "web2api_test_tool",
+				"description": "Returns a short diagnostic string for account testing.",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"message": map[string]any{"type": "string"},
+					},
+				},
+			},
+		}}
+	}
+	body, _ := json.Marshal(request)
+
+	rec := httptest.NewRecorder()
+	fakeCtx, _ := gin.CreateTestContext(rec)
+	fakeReq, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	fakeReq.Header = c.Request.Header.Clone()
+	fakeCtx.Request = fakeReq
+
+	result, err := webSvc.ForwardAsChatCompletions(c.Request.Context(), fakeCtx, account, body, nil)
+	if err != nil {
+		return s.sendErrorAndEnd(c, err.Error())
+	}
+	testComplete, err := s.emitWebChatTestEventsFromSSE(c, rec.Body.String())
+	if err != nil {
+		return s.sendErrorAndEnd(c, err.Error())
+	}
+	if result != nil && result.UsageEstimated {
+		s.sendEvent(c, TestEvent{Type: "usage", Data: map[string]any{
+			"input_tokens":  result.Usage.InputTokens,
+			"output_tokens": result.Usage.OutputTokens,
+			"total_tokens":  result.Usage.InputTokens + result.Usage.OutputTokens + result.Usage.CacheCreationInputTokens + result.Usage.CacheReadInputTokens,
+			"source":        webUsageSource(true),
+		}})
+	}
+	s.sendEvent(c, TestEvent{Type: "test_complete", Success: testComplete})
+	return nil
+}
+
+func webCredentialsLikelySupportTools(creds webCredentials) bool {
+	template := creds.RequestTemplate + " " + creds.StreamRequestTemplate
+	return strings.Contains(template, "{{tools_json}}") ||
+		strings.Contains(template, "{{tool_choice_json}}") ||
+		strings.TrimSpace(creds.Response.ToolCalls.Path) != ""
+}
+
+func (s *AccountTestService) emitWebChatTestEventsFromSSE(c *gin.Context, body string) (bool, error) {
+	sawOutput := false
+	sawFinish := false
+	seenRequestIDs := map[string]struct{}{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		if !gjson.Valid(payload) {
+			s.sendEvent(c, TestEvent{Type: "parse_error", Error: "Web stream contained an invalid JSON event"})
+			continue
+		}
+		if msg := strings.TrimSpace(gjson.Get(payload, "error.message").String()); msg != "" {
+			return false, fmt.Errorf("%s", msg)
+		}
+		if requestID := strings.TrimSpace(gjson.Get(payload, "id").String()); requestID != "" {
+			if _, ok := seenRequestIDs[requestID]; !ok {
+				seenRequestIDs[requestID] = struct{}{}
+				s.sendEvent(c, TestEvent{Type: "request_id", Text: requestID})
+			}
+		}
+		if content := gjson.Get(payload, "choices.0.delta.content"); content.Exists() && content.String() != "" {
+			sawOutput = true
+			s.sendEvent(c, TestEvent{Type: "text_delta", Text: content.String()})
+		}
+		toolCalls := gjson.Get(payload, "choices.0.delta.tool_calls")
+		if toolCalls.Exists() {
+			for _, tc := range toolCalls.Array() {
+				data := map[string]any{
+					"index":     tc.Get("index").Int(),
+					"id":        tc.Get("id").String(),
+					"name":      tc.Get("function.name").String(),
+					"arguments": tc.Get("function.arguments").String(),
+				}
+				sawOutput = true
+				s.sendEvent(c, TestEvent{Type: "tool_call", Data: data})
+			}
+		}
+		if usage := gjson.Get(payload, "usage"); usage.Exists() && usage.Raw != "" {
+			var data map[string]any
+			if err := json.Unmarshal([]byte(usage.Raw), &data); err == nil {
+				s.sendEvent(c, TestEvent{Type: "usage", Data: data})
+			}
+		}
+		if finish := gjson.Get(payload, "choices.0.finish_reason"); finish.Exists() && finish.String() != "" {
+			sawFinish = true
+		}
+	}
+	if !sawOutput {
+		return false, fmt.Errorf("Web upstream returned an empty streaming test response")
+	}
+	return sawFinish || sawOutput, nil
 }
 
 // testClaudeAccountConnection tests an Anthropic Claude account's connection
@@ -1089,7 +1284,7 @@ func parseTestSSEOutput(body string) (responseText, errMsg string) {
 			continue
 		}
 		switch event.Type {
-		case "content":
+		case "content", "text_delta":
 			if event.Text != "" {
 				texts = append(texts, event.Text)
 			}

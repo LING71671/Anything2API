@@ -67,6 +67,7 @@ type ParsedRequest struct {
 	Model           string          // 请求的模型名称
 	Stream          bool            // 是否为流式请求
 	MetadataUserID  string          // metadata.user_id（用于会话亲和）
+	SessionHash     string          // 预先计算好的粘性会话 hash（供下游适配器复用）
 	System          any             // system 字段内容
 	Messages        []any           // messages 数组
 	HasSystem       bool            // 是否包含 system 字段（包含 null 也视为显式传入）

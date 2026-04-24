@@ -11,6 +11,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,7 @@ type AccountHandler struct {
 	sessionLimitCache       service.SessionLimitCache
 	rpmCache                service.RPMCache
 	tokenCacheInvalidator   service.TokenCacheInvalidator
+	platformService         *service.PlatformService
 }
 
 // NewAccountHandler creates a new admin account handler
@@ -75,7 +77,12 @@ func NewAccountHandler(
 	sessionLimitCache service.SessionLimitCache,
 	rpmCache service.RPMCache,
 	tokenCacheInvalidator service.TokenCacheInvalidator,
+	platformServices ...*service.PlatformService,
 ) *AccountHandler {
+	var platformService *service.PlatformService
+	if len(platformServices) > 0 {
+		platformService = platformServices[0]
+	}
 	return &AccountHandler{
 		adminService:            adminService,
 		oauthService:            oauthService,
@@ -90,6 +97,7 @@ func NewAccountHandler(
 		sessionLimitCache:       sessionLimitCache,
 		rpmCache:                rpmCache,
 		tokenCacheInvalidator:   tokenCacheInvalidator,
+		platformService:         platformService,
 	}
 }
 
@@ -1883,6 +1891,32 @@ func (h *AccountHandler) GetAvailableModels(c *gin.Context) {
 		return
 	}
 
+	if service.IsWebPlatformKey(account.Platform) {
+		mapping := h.webAccountModelMapping(c.Request.Context(), account)
+		models := make([]claude.Model, 0, max(1, len(mapping)))
+		for requestedModel := range mapping {
+			models = append(models, claude.Model{
+				ID:          requestedModel,
+				Type:        "model",
+				DisplayName: requestedModel,
+				CreatedAt:   "",
+			})
+		}
+		if len(models) == 0 {
+			models = append(models, claude.Model{
+				ID:          "web-default",
+				Type:        "model",
+				DisplayName: "Web Default",
+				CreatedAt:   "",
+			})
+		}
+		sort.SliceStable(models, func(i, j int) bool {
+			return webModelSortKey(models[i].ID) < webModelSortKey(models[j].ID)
+		})
+		response.Success(c, models)
+		return
+	}
+
 	// Handle Claude/Anthropic accounts
 	// For OAuth and Setup-Token accounts: return default models
 	if account.IsOAuth() {
@@ -1922,6 +1956,60 @@ func (h *AccountHandler) GetAvailableModels(c *gin.Context) {
 	}
 
 	response.Success(c, models)
+}
+
+func (h *AccountHandler) webAccountModelMapping(ctx context.Context, account *service.Account) map[string]string {
+	mapping := account.GetModelMapping()
+	if len(mapping) > 0 {
+		return mapping
+	}
+
+	var raw map[string]any
+	if h.platformService != nil && account.Platform != service.PlatformWeb {
+		if platform, err := h.platformService.GetWebSourcePlatform(ctx, account.Platform); err == nil && platform != nil {
+			raw = platform.DefaultModelMapping
+		}
+	}
+	if len(raw) == 0 && account.Platform == "onyx_web" {
+		raw = service.DefaultOnyxWebModelMapping()
+	}
+
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
+}
+
+func webModelSortKey(model string) string {
+	order := map[string]string{
+		"web-default":      "00",
+		"gpt5.4":           "01",
+		"gpt-5.4":          "02",
+		"gpt5.2":           "03",
+		"gpt-5.2":          "04",
+		"generate_image":   "05",
+		"generate-image":   "06",
+		"image":            "07",
+		"image-generation": "08",
+		"opus4.7":          "09",
+		"opus-4.7":         "10",
+		"opus4.6":          "11",
+		"opus-4.6":         "12",
+		"sonnet4.6":        "13",
+		"sonnet-4.6":       "14",
+		"sonnet4.5":        "15",
+		"sonnet-4.5":       "16",
+	}
+	if prefix, ok := order[model]; ok {
+		return prefix + ":" + model
+	}
+	return "99:" + model
 }
 
 // SetPrivacy handles setting privacy for a single OpenAI/Antigravity OAuth account

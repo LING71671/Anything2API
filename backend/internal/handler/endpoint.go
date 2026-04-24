@@ -88,6 +88,12 @@ func DeriveUpstreamEndpoint(inbound, rawRequestPath, platform string) string {
 			return EndpointGeminiModels
 		}
 		return EndpointMessages
+
+	case service.PlatformWeb:
+		return EndpointMessages
+	}
+	if service.IsWebPlatformKey(platform) {
+		return EndpointMessages
 	}
 
 	// Unknown platform — fall back to inbound.
